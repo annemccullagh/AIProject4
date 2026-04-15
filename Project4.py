@@ -1,4 +1,5 @@
-#Stress Level Prediction from Multimodal Wearable & Smartphone Data
+#Stress Level Prediction from Multimodal Wearable & Smartphone Data 
+#Anne McCullagh, Brady Galligan, Luke Mele, Thomas Rua
 
 import os
 import glob
@@ -111,4 +112,358 @@ if not exploration_df.empty:
     print(f"\nSample survey files for {sample_p['participant']}:")
     for f in sorted(sample_p.get('survey_files', [])):
         print(f"  - {f}")
+# =============================================================================
+# TASK 3: DATA PREPROCESSING
+# =============================================================================
+print("\n" + "="*70)
+print("TASK 3: DATA PREPROCESSING")
+print("="*70)
+
+import numpy as np
+
+def find_csv_file(folder, keywords=None):
+    """Return first CSV file in folder matching any keyword."""
+    if not os.path.exists(folder):
+        return None
+    
+    files = [f for f in os.listdir(folder) if f.endswith(".csv")]
+    if keywords is None:
+        return os.path.join(folder, files[0]) if files else None
+    
+    for f in files:
+        fname = f.lower()
+        if any(k.lower() in fname for k in keywords):
+            return os.path.join(folder, f)
+    return None
+
+def safe_read_csv(path):
+    """Read CSV safely."""
+    if path is None or not os.path.exists(path):
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        print(f"Could not read {path}: {e}")
+        return None
+
+def find_datetime_column(df):
+    """Try to detect datetime column."""
+    if df is None:
+        return None
+    
+    candidates = [
+        "timestamp", "datetime", "date", "local_date", "time",
+        "start_time", "end_time", "created_at"
+    ]
+    
+    lower_cols = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in lower_cols:
+            return lower_cols[cand]
+    return None
+
+def convert_to_date(df):
+    """Convert datetime column to date."""
+    if df is None or df.empty:
+        return None
+    
+    dt_col = find_datetime_column(df)
+    if dt_col is None:
+        return None
+    
+    try:
+        df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+        df["date"] = df[dt_col].dt.date
+        return df
+    except:
+        return None
+
+def numeric_columns(df):
+    """Return numeric columns only."""
+    if df is None:
+        return []
+    return df.select_dtypes(include=[np.number]).columns.tolist()
+
+def daily_aggregate(df, prefix):
+    """
+    Aggregate numeric columns by day.
+    Creates mean values for numeric columns.
+    """
+    if df is None or df.empty:
+        return None
+    
+    df = convert_to_date(df)
+    if df is None or "date" not in df.columns:
+        return None
+    
+    num_cols = numeric_columns(df)
+    if not num_cols:
+        return None
+    
+    grouped = df.groupby("date")[num_cols].mean().reset_index()
+    grouped = grouped.rename(columns={col: f"{prefix}_{col}" for col in num_cols})
+    return grouped
+
+def event_count_by_day(df, prefix):
+    """
+    Count number of rows/events per day for event-style data
+    such as notifications, calls, messages, screen events.
+    """
+    if df is None or df.empty:
+        return None
+    
+    df = convert_to_date(df)
+    if df is None or "date" not in df.columns:
+        return None
+    
+    counts = df.groupby("date").size().reset_index(name=f"{prefix}_count")
+    return counts
+
+all_daily_features = []
+
+for p_dir in participant_dirs:
+    pid = os.path.basename(p_dir)
+    print(f"Processing {pid}...")
+    
+    participant_daily = None
+    
+    # ---------------------------
+    # AWARE DATA
+    # ---------------------------
+    aware_dir = os.path.join(p_dir, "Aware")
+    
+    notif_file = find_csv_file(aware_dir, ["notification"])
+    call_file = find_csv_file(aware_dir, ["call"])
+    message_file = find_csv_file(aware_dir, ["message", "sms"])
+    screen_file = find_csv_file(aware_dir, ["screen"])
+    battery_file = find_csv_file(aware_dir, ["battery"])
+    
+    notif_df = safe_read_csv(notif_file)
+    call_df = safe_read_csv(call_file)
+    message_df = safe_read_csv(message_file)
+    screen_df = safe_read_csv(screen_file)
+    battery_df = safe_read_csv(battery_file)
+    
+    notif_daily = event_count_by_day(notif_df, "notif")
+    call_daily = event_count_by_day(call_df, "call")
+    message_daily = event_count_by_day(message_df, "message")
+    screen_daily = event_count_by_day(screen_df, "screen")
+    battery_daily = daily_aggregate(battery_df, "battery")
+    
+    aware_parts = [notif_daily, call_daily, message_daily, screen_daily, battery_daily]
+    aware_parts = [x for x in aware_parts if x is not None]
+    
+    if aware_parts:
+        aware_merged = aware_parts[0]
+        for part in aware_parts[1:]:
+            aware_merged = pd.merge(aware_merged, part, on="date", how="outer")
+        participant_daily = aware_merged
+    
+    # ---------------------------
+    # OURA DATA
+    # ---------------------------
+    oura_dir = os.path.join(p_dir, "Oura")
+    oura_file = find_csv_file(oura_dir)
+    oura_df = safe_read_csv(oura_file)
+    
+    oura_daily = daily_aggregate(oura_df, "oura")
+    if oura_daily is not None:
+        if participant_daily is None:
+            participant_daily = oura_daily
+        else:
+            participant_daily = pd.merge(participant_daily, oura_daily, on="date", how="outer")
+    
+    # ---------------------------
+    # WATCH DATA
+    # ---------------------------
+    watch_dir = os.path.join(p_dir, "Watch")
+    if os.path.exists(watch_dir):
+        watch_files = [os.path.join(watch_dir, f) for f in os.listdir(watch_dir) if f.endswith(".csv")]
+        watch_parts = []
+        
+        for wf in watch_files[:5]:  # limit to first few files to keep it manageable
+            wdf = safe_read_csv(wf)
+            prefix = os.path.splitext(os.path.basename(wf))[0][:15]
+            daily_w = daily_aggregate(wdf, prefix)
+            if daily_w is not None:
+                watch_parts.append(daily_w)
+        
+        if watch_parts:
+            watch_merged = watch_parts[0]
+            for part in watch_parts[1:]:
+                watch_merged = pd.merge(watch_merged, part, on="date", how="outer")
+            
+            if participant_daily is None:
+                participant_daily = watch_merged
+            else:
+                participant_daily = pd.merge(participant_daily, watch_merged, on="date", how="outer")
+    
+    # ---------------------------
+    # ADD PARTICIPANT ID
+    # ---------------------------
+    if participant_daily is not None and not participant_daily.empty:
+        participant_daily["participant"] = pid
+        all_daily_features.append(participant_daily)
+
+# Combine all participants
+if all_daily_features:
+    daily_features_df = pd.concat(all_daily_features, ignore_index=True)
+else:
+    daily_features_df = pd.DataFrame()
+
+print(f"\nCombined daily feature table shape: {daily_features_df.shape}")
+print("Columns:")
+print(daily_features_df.columns.tolist()[:20])
+
+# ---------------------------
+# HANDLE MISSING VALUES
+# ---------------------------
+if not daily_features_df.empty:
+    numeric_cols = daily_features_df.select_dtypes(include=[np.number]).columns
+    
+    # Drop columns with too much missing data (>50%)
+    missing_ratio = daily_features_df[numeric_cols].isnull().mean()
+    keep_cols = missing_ratio[missing_ratio <= 0.5].index.tolist()
+    
+    base_cols = ["participant", "date"]
+    daily_features_df = daily_features_df[base_cols + keep_cols]
+    
+    # Median imputation for remaining numeric missing values
+    for col in keep_cols:
+        daily_features_df[col] = daily_features_df[col].fillna(daily_features_df[col].median())
+    
+    # Remove duplicates
+    daily_features_df = daily_features_df.drop_duplicates(subset=["participant", "date"])
+
+print(f"\nDaily feature table after cleaning: {daily_features_df.shape}")
+
+# Save preprocessed features
+daily_features_path = os.path.join(OUTPUT_DIR, "daily_features.csv")
+daily_features_df.to_csv(daily_features_path, index=False)
+print(f"Saved daily features to: {daily_features_path}")
+# =============================================================================
+# TASK 4: DEFINE A PREDICTION TASK
+# =============================================================================
+print("\n" + "="*70)
+print("TASK 4: DEFINE A PREDICTION TASK")
+print("="*70)
+
+def find_stress_survey_file(survey_dir):
+    """Find a likely stress-related survey CSV."""
+    if not os.path.exists(survey_dir):
+        return None
+    
+    survey_files = [f for f in os.listdir(survey_dir) if f.endswith(".csv")]
+    
+    for f in survey_files:
+        name = f.lower()
+        if ("stress" in name) or ("pss" in name) or ("perceived stress" in name):
+            return os.path.join(survey_dir, f)
+    return None
+
+def extract_stress_labels(p_dir):
+    """
+    Extract stress labels from survey file.
+    This tries to:
+    1. find a stress-related survey file
+    2. identify a score column
+    3. convert date
+    """
+    pid = os.path.basename(p_dir)
+    survey_dir = os.path.join(p_dir, "Surveys")
+    stress_file = find_stress_survey_file(survey_dir)
+    
+    if stress_file is None:
+        return None
+    
+    df = safe_read_csv(stress_file)
+    if df is None or df.empty:
+        return None
+    
+    df = convert_to_date(df)
+    if df is None:
+        return None
+    
+    # Try to locate a stress score column
+    possible_score_cols = []
+    for col in df.columns:
+        col_lower = col.lower()
+        if ("stress" in col_lower) or ("pss" in col_lower) or ("score" in col_lower):
+            possible_score_cols.append(col)
+    
+    # Keep only numeric candidate columns
+    score_col = None
+    for col in possible_score_cols:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            score_col = col
+            break
+    
+    if score_col is None:
+        # fallback: first numeric column not date
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if num_cols:
+            score_col = num_cols[0]
+        else:
+            return None
+    
+    out = df[["date", score_col]].copy()
+    out["participant"] = pid
+    out = out.rename(columns={score_col: "stress_score"})
+    out = out.dropna(subset=["stress_score"])
+    
+    return out
+
+# Collect stress labels from all participants
+stress_label_list = []
+
+for p_dir in participant_dirs:
+    stress_df = extract_stress_labels(p_dir)
+    if stress_df is not None and not stress_df.empty:
+        stress_label_list.append(stress_df)
+
+if stress_label_list:
+    stress_labels_df = pd.concat(stress_label_list, ignore_index=True)
+else:
+    stress_labels_df = pd.DataFrame(columns=["participant", "date", "stress_score"])
+
+print(f"Stress label rows found: {len(stress_labels_df)}")
+
+if not stress_labels_df.empty:
+    print("\nSample stress labels:")
+    print(stress_labels_df.head())
+
+# ----------------------------------------
+# CREATE BINARY TARGET: HIGH vs LOW STRESS
+# ----------------------------------------
+if not stress_labels_df.empty:
+    median_stress = stress_labels_df["stress_score"].median()
+    stress_labels_df["stress_label"] = (stress_labels_df["stress_score"] >= median_stress).astype(int)
+    
+    print(f"\nMedian stress score used as cutoff: {median_stress}")
+    print("Label distribution:")
+    print(stress_labels_df["stress_label"].value_counts())
+
+# ----------------------------------------
+# MERGE FEATURES WITH LABELS
+# ----------------------------------------
+if not daily_features_df.empty and not stress_labels_df.empty:
+    modeling_df = pd.merge(
+        daily_features_df,
+        stress_labels_df,
+        on=["participant", "date"],
+        how="inner"
+    )
+else:
+    modeling_df = pd.DataFrame()
+
+print(f"\nFinal modeling dataset shape: {modeling_df.shape}")
+
+if not modeling_df.empty:
+    print("\nTarget variable distribution:")
+    print(modeling_df["stress_label"].value_counts())
+
+# Save modeling dataset
+modeling_path = os.path.join(OUTPUT_DIR, "stress_modeling_dataset.csv")
+modeling_df.to_csv(modeling_path, index=False)
+print(f"Saved modeling dataset to: {modeling_path}")
 
