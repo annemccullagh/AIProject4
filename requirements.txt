@@ -1,0 +1,8 @@
+# When u try to run Project4.py, u will need to create a venv and install this
+# pip install -r requirements.txt
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+xgboost==2.1.1
+matplotlib==3.9.2
+seaborn==0.13.2

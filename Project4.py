@@ -276,27 +276,38 @@ for p_dir in participant_dirs:
     # ---------------------------
     # WATCH DATA
     # ---------------------------
-    watch_dir = os.path.join(p_dir, "Watch")
-    if os.path.exists(watch_dir):
-        watch_files = [os.path.join(watch_dir, f) for f in os.listdir(watch_dir) if f.endswith(".csv")]
-        watch_parts = []
-        
-        for wf in watch_files[:5]:  # limit to first few files to keep it manageable
-            wdf = safe_read_csv(wf)
-            prefix = os.path.splitext(os.path.basename(wf))[0][:15]
-            daily_w = daily_aggregate(wdf, prefix)
-            if daily_w is not None:
-                watch_parts.append(daily_w)
-        
-        if watch_parts:
-            watch_merged = watch_parts[0]
-            for part in watch_parts[1:]:
-                watch_merged = pd.merge(watch_merged, part, on="date", how="outer")
-            
+    # ---------------------------
+# WATCH DATA
+# ---------------------------
+watch_dir = os.path.join(p_dir, "Watch")
+if os.path.exists(watch_dir):
+    watch_files = [
+        os.path.join(watch_dir, f)
+        for f in os.listdir(watch_dir)
+        if f.endswith(".csv")
+    ]
+
+    watch_dfs = []
+
+    for wf in watch_files[:5]:   # keep your current limit for now
+        wdf = safe_read_csv(wf)
+        if wdf is not None and not wdf.empty:
+            watch_dfs.append(wdf)
+
+    if watch_dfs:
+        combined_watch_df = pd.concat(watch_dfs, ignore_index=True)
+        watch_daily = daily_aggregate(combined_watch_df, "watch")
+
+        if watch_daily is not None:
             if participant_daily is None:
-                participant_daily = watch_merged
+                participant_daily = watch_daily
             else:
-                participant_daily = pd.merge(participant_daily, watch_merged, on="date", how="outer")
+                participant_daily = pd.merge(
+                    participant_daily,
+                    watch_daily,
+                    on="date",
+                    how="outer"
+                )
     
     # ---------------------------
     # ADD PARTICIPANT ID
@@ -467,3 +478,169 @@ modeling_path = os.path.join(OUTPUT_DIR, "stress_modeling_dataset.csv")
 modeling_df.to_csv(modeling_path, index=False)
 print(f"Saved modeling dataset to: {modeling_path}")
 
+
+# =============================================================================
+# TASK 5: APPLY MACHINE LEARNING MODELS
+# =============================================================================
+print("\n" + "="*70)
+print("TASK 5: APPLY MACHINE LEARNING MODELS")
+print("="*70)
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# XGBoost import
+try:
+    from xgboost import XGBClassifier
+    xgb_available = True
+except ImportError:
+    print("XGBoost is not installed. Run: pip install xgboost")
+    xgb_available = False
+
+if modeling_df.empty:
+    print("Modeling dataset is empty. Cannot train models.")
+else:
+    # ---------------------------
+    # PREPARE X AND y
+    # ---------------------------
+    drop_cols = ["participant", "date", "stress_score", "stress_label"]
+    feature_cols = [c for c in modeling_df.columns if c not in drop_cols]
+
+    X = modeling_df[feature_cols].copy()
+    y = modeling_df["stress_label"].copy()
+
+    print(f"Number of rows in modeling dataset: {len(modeling_df)}")
+    print(f"Number of features: {len(feature_cols)}")
+
+    # Optional: remove zero-variance columns
+    nunique = X.nunique(dropna=False)
+    constant_cols = nunique[nunique <= 1].index.tolist()
+    if constant_cols:
+        X = X.drop(columns=constant_cols)
+        feature_cols = [c for c in feature_cols if c not in constant_cols]
+        print(f"Removed {len(constant_cols)} constant feature columns")
+
+    # ---------------------------
+    # TRAIN / TEST SPLIT
+    # ---------------------------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y
+    )
+
+    # ---------------------------
+    # DEFINE MODELS
+    # ---------------------------
+    models = {
+        "SVM": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", SVC(kernel="rbf", probability=True, random_state=42))
+        ]),
+
+        "Random Forest": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", RandomForestClassifier(
+                n_estimators=200,
+                max_depth=None,
+                min_samples_split=2,
+                random_state=42
+            ))
+        ]),
+
+        "Neural Network": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", MLPClassifier(
+                hidden_layer_sizes=(64, 32),
+                activation="relu",
+                max_iter=500,
+                random_state=42
+            ))
+        ])
+    }
+
+    if xgb_available:
+        models["XGBoost"] = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", XGBClassifier(
+                n_estimators=200,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                eval_metric="logloss",
+                random_state=42
+            ))
+        ])
+
+    # ---------------------------
+    # TRAIN AND EVALUATE
+    # ---------------------------
+    results = []
+
+    for model_name, model in models.items():
+        print(f"\nTraining {model_name}...")
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+
+        # probability or decision score for ROC-AUC
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(X_test)[:, 1]
+        elif hasattr(model, "decision_function"):
+            y_score = model.decision_function(X_test)
+        else:
+            y_score = None
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+
+        if y_score is not None:
+            auc = roc_auc_score(y_test, y_score)
+        else:
+            auc = float("nan")
+
+        results.append({
+            "model": model_name,
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1_score": f1,
+            "roc_auc": auc
+        })
+
+        print(classification_report(y_test, y_pred, zero_division=0))
+
+    results_df = pd.DataFrame(results).sort_values(by="f1_score", ascending=False)
+    print("\nModel Comparison:")
+    print(results_df)
+
+    results_path = os.path.join(OUTPUT_DIR, "task5_model_results.csv")
+    results_df.to_csv(results_path, index=False)
+    print(f"Saved Task 5 results to: {results_path}")
+
+    # ---------------------------
+    # FEATURE IMPORTANCE FOR TREE MODELS
+    # ---------------------------
+    print("\nTop Features:")
+    for model_name, model in models.items():
+        clf = model.named_steps["clf"]
+        if hasattr(clf, "feature_importances_"):
+            importances = pd.Series(clf.feature_importances_, index=X.columns)
+            top_feats = importances.sort_values(ascending=False).head(10)
+            print(f"\n{model_name} top 10 features:")
+            print(top_feats)
