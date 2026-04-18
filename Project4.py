@@ -3,6 +3,7 @@
 
 import os
 import glob
+import re
 import pandas as pd
 
 DATASET_PATH = "Loneliness_Dataset_Nov10" #dataset path
@@ -100,11 +101,14 @@ for p_dir in participant_dirs:
 exploration_df = pd.DataFrame(exploration_data)
 
 print(f"\nTotal participants found: {len(exploration_df)}")
-print(f"Participants with Aware data: {exploration_df['has_aware'].sum()}")
-print(f"Participants with Oura data: {exploration_df['has_oura'].sum()}")
-print(f"Participants with Watch data: {exploration_df['has_watch'].sum()}")
-print(f"Participants with Survey data: {exploration_df['has_surveys'].sum()}")
-print(f"Participants with weekly PSS: {exploration_df['has_pss_weekly'].sum()}")
+if not exploration_df.empty:
+    print(f"Participants with Aware data: {exploration_df['has_aware'].sum()}")
+    print(f"Participants with Oura data: {exploration_df['has_oura'].sum()}")
+    print(f"Participants with Watch data: {exploration_df['has_watch'].sum()}")
+    print(f"Participants with Survey data: {exploration_df['has_surveys'].sum()}")
+    print(f"Participants with weekly PSS: {exploration_df['has_pss_weekly'].sum()}")
+else:
+    print("No participant folders found under DATASET_PATH.")
 
 # Show survey files for one participant to understand naming
 if not exploration_df.empty:
@@ -152,8 +156,8 @@ def find_datetime_column(df):
         return None
     
     candidates = [
-        "timestamp", "datetime", "date", "local_date", "time",
-        "start_time", "end_time", "created_at"
+        "date", "local_date", "datetime", "time",
+        "start_time", "end_time", "created_at", "timestamp"
     ]
     
     lower_cols = {c.lower(): c for c in df.columns}
@@ -172,7 +176,25 @@ def convert_to_date(df):
         return None
     
     try:
-        df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+        series = df[dt_col]
+
+        if pd.api.types.is_numeric_dtype(series):
+            non_na = series.dropna()
+            if not non_na.empty:
+                max_abs = non_na.abs().max()
+                # Heuristic: unix timestamps in ms are around 1e12+, seconds around 1e9.
+                if max_abs >= 1e11:
+                    parsed = pd.to_datetime(series, unit="ms", errors="coerce")
+                elif max_abs >= 1e9:
+                    parsed = pd.to_datetime(series, unit="s", errors="coerce")
+                else:
+                    parsed = pd.to_datetime(series, errors="coerce")
+            else:
+                parsed = pd.to_datetime(series, errors="coerce")
+        else:
+            parsed = pd.to_datetime(series, errors="coerce")
+
+        df[dt_col] = parsed
         df["date"] = df[dt_col].dt.date
         return df
     except:
@@ -276,38 +298,35 @@ for p_dir in participant_dirs:
     # ---------------------------
     # WATCH DATA
     # ---------------------------
-    # ---------------------------
-# WATCH DATA
-# ---------------------------
-watch_dir = os.path.join(p_dir, "Watch")
-if os.path.exists(watch_dir):
-    watch_files = [
-        os.path.join(watch_dir, f)
-        for f in os.listdir(watch_dir)
-        if f.endswith(".csv")
-    ]
+    watch_dir = os.path.join(p_dir, "Watch")
+    if os.path.exists(watch_dir):
+        watch_files = [
+            os.path.join(watch_dir, f)
+            for f in os.listdir(watch_dir)
+            if f.endswith(".csv")
+        ]
 
-    watch_dfs = []
+        watch_dfs = []
 
-    for wf in watch_files[:5]:   # keep your current limit for now
-        wdf = safe_read_csv(wf)
-        if wdf is not None and not wdf.empty:
-            watch_dfs.append(wdf)
+        for wf in watch_files[:5]:
+            wdf = safe_read_csv(wf)
+            if wdf is not None and not wdf.empty:
+                watch_dfs.append(wdf)
 
-    if watch_dfs:
-        combined_watch_df = pd.concat(watch_dfs, ignore_index=True)
-        watch_daily = daily_aggregate(combined_watch_df, "watch")
+        if watch_dfs:
+            combined_watch_df = pd.concat(watch_dfs, ignore_index=True)
+            watch_daily = daily_aggregate(combined_watch_df, "watch")
 
-        if watch_daily is not None:
-            if participant_daily is None:
-                participant_daily = watch_daily
-            else:
-                participant_daily = pd.merge(
-                    participant_daily,
-                    watch_daily,
-                    on="date",
-                    how="outer"
-                )
+            if watch_daily is not None:
+                if participant_daily is None:
+                    participant_daily = watch_daily
+                else:
+                    participant_daily = pd.merge(
+                        participant_daily,
+                        watch_daily,
+                        on="date",
+                        how="outer"
+                    )
     
     # ---------------------------
     # ADD PARTICIPANT ID
@@ -366,10 +385,22 @@ def find_stress_survey_file(survey_dir):
     
     survey_files = [f for f in os.listdir(survey_dir) if f.endswith(".csv")]
     
+    weekly_candidates = []
+    generic_candidates = []
+
     for f in survey_files:
         name = f.lower()
         if ("stress" in name) or ("pss" in name) or ("perceived stress" in name):
-            return os.path.join(survey_dir, f)
+            if ("every week" in name) or ("weekly" in name):
+                weekly_candidates.append(f)
+            else:
+                generic_candidates.append(f)
+
+    if weekly_candidates:
+        return os.path.join(survey_dir, weekly_candidates[0])
+    if generic_candidates:
+        return os.path.join(survey_dir, generic_candidates[0])
+
     return None
 
 def extract_stress_labels(p_dir):
@@ -410,12 +441,50 @@ def extract_stress_labels(p_dir):
             break
     
     if score_col is None:
-        # fallback: first numeric column not date
+        # PSS responses are often stored as text across q1..qN columns.
+        likert_cols = [
+            col for col in df.columns
+            if re.fullmatch(r"q\d+", str(col).strip().lower())
+        ]
+
+        if likert_cols:
+            likert_map = {
+                "never": 0,
+                "almost never": 1,
+                "sometimes": 2,
+                "fairly often": 3,
+                "very often": 4
+            }
+
+            converted = pd.DataFrame(index=df.index)
+            for col in likert_cols:
+                converted[col] = (
+                    df[col]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .map(likert_map)
+                )
+
+            if converted.notna().any().any():
+                df["derived_pss_score"] = converted.sum(axis=1, min_count=1)
+                score_col = "derived_pss_score"
+
+    if score_col is None:
+        # fallback: first likely numeric score column, excluding metadata-like fields
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if num_cols:
-            score_col = num_cols[0]
-        else:
-            return None
+        filtered_num_cols = []
+        for col in num_cols:
+            c = col.lower()
+            if any(tag in c for tag in ["timestamp", "date", "time", "participant", "id"]):
+                continue
+            filtered_num_cols.append(col)
+
+        if filtered_num_cols:
+            score_col = filtered_num_cols[0]
+
+    if score_col is None:
+        return None
     
     out = df[["date", score_col]].copy()
     out["participant"] = pid
@@ -486,7 +555,7 @@ print("\n" + "="*70)
 print("TASK 5: APPLY MACHINE LEARNING MODELS")
 print("="*70)
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -494,6 +563,7 @@ from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report
+from sklearn.inspection import permutation_importance
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -505,6 +575,137 @@ try:
 except ImportError:
     print("XGBoost is not installed. Run: pip install xgboost")
     xgb_available = False
+
+def build_models(xgb_available_flag):
+    """Create model dictionary used across Task 5 and Task 6."""
+    out_models = {
+        "SVM": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", SVC(kernel="rbf", probability=True, random_state=42))
+        ]),
+        "Random Forest": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", RandomForestClassifier(
+                n_estimators=200,
+                max_depth=None,
+                min_samples_split=2,
+                random_state=42
+            ))
+        ]),
+        "Neural Network": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", MLPClassifier(
+                hidden_layer_sizes=(64, 32),
+                activation="relu",
+                max_iter=500,
+                random_state=42
+            ))
+        ])
+    }
+
+    if xgb_available_flag:
+        out_models["XGBoost"] = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", XGBClassifier(
+                n_estimators=200,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                eval_metric="logloss",
+                random_state=42
+            ))
+        ])
+
+    return out_models
+
+
+def get_scores(model, X_data):
+    """Return decision scores or probabilities for ROC-AUC."""
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X_data)[:, 1]
+    if hasattr(model, "decision_function"):
+        return model.decision_function(X_data)
+    return None
+
+
+def evaluate_models(X, y, models_dict):
+    """Run train/test and cross-validation evaluation."""
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y
+    )
+
+    holdout_rows = []
+    cv_rows = []
+    trained = {}
+    predictions = {}
+
+    minority_count = int(y.value_counts().min())
+    cv_folds = min(5, minority_count)
+    run_cv = cv_folds >= 2
+
+    for model_name, model in models_dict.items():
+        print(f"\nTraining {model_name}...")
+        model.fit(X_train, y_train)
+        trained[model_name] = model
+
+        y_pred = model.predict(X_test)
+        y_score = get_scores(model, X_test)
+        predictions[model_name] = {"y_pred": y_pred, "y_score": y_score}
+
+        holdout_row = {
+            "model": model_name,
+            "split_type": "train_test",
+            "accuracy": accuracy_score(y_test, y_pred),
+            "precision": precision_score(y_test, y_pred, zero_division=0),
+            "recall": recall_score(y_test, y_pred, zero_division=0),
+            "f1_score": f1_score(y_test, y_pred, zero_division=0),
+            "roc_auc": roc_auc_score(y_test, y_score) if y_score is not None else float("nan")
+        }
+        holdout_rows.append(holdout_row)
+
+        print(classification_report(y_test, y_pred, zero_division=0))
+
+        if run_cv:
+            cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+            scoring = {
+                "accuracy": "accuracy",
+                "precision": "precision",
+                "recall": "recall",
+                "f1": "f1",
+                "roc_auc": "roc_auc"
+            }
+            cv_out = cross_validate(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
+
+            cv_rows.append({
+                "model": model_name,
+                "split_type": f"{cv_folds}_fold_cv",
+                "accuracy": cv_out["test_accuracy"].mean(),
+                "precision": cv_out["test_precision"].mean(),
+                "recall": cv_out["test_recall"].mean(),
+                "f1_score": cv_out["test_f1"].mean(),
+                "roc_auc": cv_out["test_roc_auc"].mean()
+            })
+
+    holdout_df = pd.DataFrame(holdout_rows)
+    cv_df = pd.DataFrame(cv_rows)
+
+    return holdout_df, cv_df, trained, predictions, X_train, X_test, y_train, y_test
+
+
+if modeling_df.empty:
+    fallback_modeling_path = os.path.join(OUTPUT_DIR, "stress_modeling_dataset.csv")
+    if os.path.exists(fallback_modeling_path):
+        fallback_df = safe_read_csv(fallback_modeling_path)
+        if fallback_df is not None and not fallback_df.empty and "stress_label" in fallback_df.columns:
+            modeling_df = fallback_df
+            print(f"Loaded fallback modeling dataset from: {fallback_modeling_path}")
 
 if modeling_df.empty:
     print("Modeling dataset is empty. Cannot train models.")
@@ -529,118 +730,147 @@ else:
         feature_cols = [c for c in feature_cols if c not in constant_cols]
         print(f"Removed {len(constant_cols)} constant feature columns")
 
-    # ---------------------------
-    # TRAIN / TEST SPLIT
-    # ---------------------------
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y
+    models = build_models(xgb_available)
+
+    holdout_df, cv_df, trained_models, pred_dict, X_train, X_test, y_train, y_test = evaluate_models(
+        X,
+        y,
+        models
     )
 
     # ---------------------------
-    # DEFINE MODELS
+    # TASK 5 OUTPUT (train/test)
     # ---------------------------
-    models = {
-        "SVM": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", SVC(kernel="rbf", probability=True, random_state=42))
-        ]),
-
-        "Random Forest": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("clf", RandomForestClassifier(
-                n_estimators=200,
-                max_depth=None,
-                min_samples_split=2,
-                random_state=42
-            ))
-        ]),
-
-        "Neural Network": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", MLPClassifier(
-                hidden_layer_sizes=(64, 32),
-                activation="relu",
-                max_iter=500,
-                random_state=42
-            ))
-        ])
-    }
-
-    if xgb_available:
-        models["XGBoost"] = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("clf", XGBClassifier(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                eval_metric="logloss",
-                random_state=42
-            ))
-        ])
-
-    # ---------------------------
-    # TRAIN AND EVALUATE
-    # ---------------------------
-    results = []
-
-    for model_name, model in models.items():
-        print(f"\nTraining {model_name}...")
-        model.fit(X_train, y_train)
-
-        y_pred = model.predict(X_test)
-
-        # probability or decision score for ROC-AUC
-        if hasattr(model, "predict_proba"):
-            y_score = model.predict_proba(X_test)[:, 1]
-        elif hasattr(model, "decision_function"):
-            y_score = model.decision_function(X_test)
-        else:
-            y_score = None
-
-        acc = accuracy_score(y_test, y_pred)
-        prec = precision_score(y_test, y_pred, zero_division=0)
-        rec = recall_score(y_test, y_pred, zero_division=0)
-        f1 = f1_score(y_test, y_pred, zero_division=0)
-
-        if y_score is not None:
-            auc = roc_auc_score(y_test, y_score)
-        else:
-            auc = float("nan")
-
-        results.append({
-            "model": model_name,
-            "accuracy": acc,
-            "precision": prec,
-            "recall": rec,
-            "f1_score": f1,
-            "roc_auc": auc
-        })
-
-        print(classification_report(y_test, y_pred, zero_division=0))
-
-    results_df = pd.DataFrame(results).sort_values(by="f1_score", ascending=False)
-    print("\nModel Comparison:")
+    results_df = holdout_df.sort_values(by="f1_score", ascending=False).reset_index(drop=True)
+    print("\nModel Comparison (Train/Test):")
     print(results_df)
 
     results_path = os.path.join(OUTPUT_DIR, "task5_model_results.csv")
     results_df.to_csv(results_path, index=False)
     print(f"Saved Task 5 results to: {results_path}")
 
-    # ---------------------------
-    # FEATURE IMPORTANCE FOR TREE MODELS
-    # ---------------------------
-    print("\nTop Features:")
-    for model_name, model in models.items():
-        clf = model.named_steps["clf"]
-        if hasattr(clf, "feature_importances_"):
-            importances = pd.Series(clf.feature_importances_, index=X.columns)
-            top_feats = importances.sort_values(ascending=False).head(10)
-            print(f"\n{model_name} top 10 features:")
-            print(top_feats)
+    # =============================================================================
+    # TASK 6: MODEL EVALUATION
+    # =============================================================================
+    print("\n" + "="*70)
+    print("TASK 6: MODEL EVALUATION")
+    print("="*70)
+
+    evaluation_df = pd.concat([holdout_df, cv_df], ignore_index=True)
+    evaluation_df = evaluation_df.sort_values(by=["split_type", "f1_score"], ascending=[True, False])
+
+    print("\nEvaluation metrics (Accuracy, Precision, Recall, F1, ROC-AUC):")
+    print(evaluation_df)
+
+    task6_path = os.path.join(OUTPUT_DIR, "task6_model_evaluation.csv")
+    evaluation_df.to_csv(task6_path, index=False)
+    print(f"Saved Task 6 evaluation to: {task6_path}")
+
+    if not cv_df.empty:
+        cv_path = os.path.join(OUTPUT_DIR, "task6_cross_validation.csv")
+        cv_df.sort_values(by="f1_score", ascending=False).to_csv(cv_path, index=False)
+        print(f"Saved Task 6 cross-validation details to: {cv_path}")
+
+    # =============================================================================
+    # TASK 7: RESULT ANALYSIS
+    # =============================================================================
+    print("\n" + "="*70)
+    print("TASK 7: RESULT ANALYSIS")
+    print("="*70)
+
+    # Best model based on holdout F1 (with ROC-AUC as tie-breaker)
+    best_row = holdout_df.sort_values(by=["f1_score", "roc_auc"], ascending=[False, False]).iloc[0]
+    best_model_name = best_row["model"]
+    best_model = trained_models[best_model_name]
+
+    print(f"Best model (by holdout F1): {best_model_name}")
+    print(f"Holdout metrics -> Accuracy: {best_row['accuracy']:.3f}, Precision: {best_row['precision']:.3f}, Recall: {best_row['recall']:.3f}, F1: {best_row['f1_score']:.3f}, ROC-AUC: {best_row['roc_auc']:.3f}")
+
+    # Feature importance for best model
+    clf = best_model.named_steps["clf"]
+    if hasattr(clf, "feature_importances_"):
+        importance_series = pd.Series(clf.feature_importances_, index=X.columns)
+        importance_method = "native_feature_importance"
+    elif hasattr(clf, "coef_"):
+        coef_vals = np.ravel(clf.coef_)
+        importance_series = pd.Series(np.abs(coef_vals), index=X.columns)
+        importance_method = "absolute_coefficients"
+    else:
+        perm = permutation_importance(
+            best_model,
+            X_test,
+            y_test,
+            n_repeats=20,
+            random_state=42,
+            scoring="f1"
+        )
+        importance_series = pd.Series(perm.importances_mean, index=X.columns)
+        importance_method = "permutation_importance_f1"
+
+    top_features = importance_series.sort_values(ascending=False).head(10)
+    print("\nMost important features (top 10):")
+    print(top_features)
+
+    feature_importance_df = pd.DataFrame({
+        "feature": top_features.index,
+        "importance": top_features.values,
+        "method": importance_method
+    })
+    fi_path = os.path.join(OUTPUT_DIR, "task7_feature_importance_best_model.csv")
+    feature_importance_df.to_csv(fi_path, index=False)
+    print(f"Saved Task 7 feature importance to: {fi_path}")
+
+    # Behavioral/mental-health insights from class-level mean differences
+    insight_rows = []
+    class_means = modeling_df.groupby("stress_label")[top_features.index.tolist()].mean()
+    if 0 in class_means.index and 1 in class_means.index:
+        for feat in top_features.index:
+            low_mean = class_means.loc[0, feat]
+            high_mean = class_means.loc[1, feat]
+            diff = high_mean - low_mean
+            direction = "higher" if diff > 0 else "lower"
+            insight_rows.append({
+                "feature": feat,
+                "mean_low_stress": low_mean,
+                "mean_high_stress": high_mean,
+                "difference_high_minus_low": diff,
+                "interpretation": f"{feat} is {direction} on average in high-stress days"
+            })
+
+    insights_df = pd.DataFrame(insight_rows)
+
+    analysis_lines = []
+    analysis_lines.append("# Task 7: Result Analysis")
+    analysis_lines.append("")
+    analysis_lines.append("## Which model performed best?")
+    analysis_lines.append(
+        f"Best model by holdout F1 score: **{best_model_name}** "
+        f"(Accuracy={best_row['accuracy']:.3f}, Precision={best_row['precision']:.3f}, "
+        f"Recall={best_row['recall']:.3f}, F1={best_row['f1_score']:.3f}, ROC-AUC={best_row['roc_auc']:.3f})."
+    )
+    analysis_lines.append("")
+    analysis_lines.append("## Which features were most important?")
+    analysis_lines.append(
+        f"Feature importance method used: **{importance_method}** from the best model."
+    )
+    for _, row in feature_importance_df.iterrows():
+        analysis_lines.append(f"- {row['feature']}: {row['importance']:.6f}")
+    analysis_lines.append("")
+    analysis_lines.append("## What insights can be drawn about behavior and mental health?")
+    if not insights_df.empty:
+        for _, row in insights_df.head(10).iterrows():
+            analysis_lines.append(
+                f"- {row['interpretation']} "
+                f"(low={row['mean_low_stress']:.3f}, high={row['mean_high_stress']:.3f}, "
+                f"delta={row['difference_high_minus_low']:.3f})."
+            )
+    else:
+        analysis_lines.append(
+            "- Not enough class-separated data to estimate directionality between high- and low-stress groups."
+        )
+
+    analysis_path = os.path.join(OUTPUT_DIR, "task7_result_analysis.md")
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(analysis_lines))
+
+    print(f"Saved Task 7 analysis report to: {analysis_path}")
